@@ -1,0 +1,1115 @@
+"""
+Radiometric Thermal UAV Imagery for Wildfire Management
+=======================================================
+This comprehensive solution implements the following key features:
+1. Real-time monitoring data processing
+2. Fire hotspot detection using CNN
+3. Fire intensity mapping
+4. Geospatial mapping integration
+5. Predictive analytics
+6. Data visualization
+
+The code assumes that the dataset contains thermal images of wildfire areas along with relevant metadata.
+"""
+
+# Standard libraries
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# Data processing
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+
+# Deep learning
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, Model, load_model
+from tensorflow.keras.layers import Dense, Conv2D, MaxPooling2D, Flatten, Dropout, BatchNormalization, Input
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.optimizers import Adam
+
+# GIS and mapping
+import geopandas as gpd
+import folium
+from folium.plugins import HeatMap
+import rasterio
+from rasterio.plot import show
+import shapely
+from shapely.geometry import Point, Polygon
+
+# Image processing
+import cv2
+from PIL import Image
+import io
+
+# Machine learning for prediction
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+
+# For visualization
+import plotly.express as px
+import plotly.graph_objects as go
+
+# Print all available files in the input directory
+print("Available input files:")
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+#=====================================================================
+# PART 1: DATA EXPLORATION AND PREPROCESSING
+#=====================================================================
+
+class DataExplorer:
+    """Class for exploring and preprocessing thermal imagery data"""
+    
+    def __init__(self, base_path):
+        """Initialize with the base path to the dataset"""
+        self.base_path = base_path
+        # Try to locate the image directory and metadata file
+        self.image_dir = self._find_image_directory()
+        self.metadata_file = self._find_metadata_file()
+        self.data = None
+        
+    def _find_image_directory(self):
+        """Find directory containing thermal images"""
+        for dirname, _, _ in os.walk(self.base_path):
+            if 'thermal' in dirname.lower() or 'images' in dirname.lower():
+                return dirname
+        # If specific directory not found, return the base path
+        return self.base_path
+    
+    def _find_metadata_file(self):
+        """Find metadata CSV file"""
+        for dirname, _, filenames in os.walk(self.base_path):
+            for filename in filenames:
+                if filename.endswith('.csv') and ('metadata' in filename.lower() or 'data' in filename.lower()):
+                    return os.path.join(dirname, filename)
+        return None
+    
+    def load_metadata(self):
+        """Load metadata if available"""
+        if self.metadata_file and os.path.exists(self.metadata_file):
+            print(f"Loading metadata from: {self.metadata_file}")
+            self.data = pd.read_csv(self.metadata_file)
+            print(f"Metadata shape: {self.data.shape}")
+            return self.data
+        else:
+            print("No metadata file found. Checking for image files directly.")
+            return None
+    
+    def scan_image_files(self):
+        """Scan for thermal image files"""
+        image_files = []
+        image_extensions = ['.tif', '.jpg', '.png', '.jpeg']
+        
+        for dirname, _, filenames in os.walk(self.image_dir):
+            for filename in filenames:
+                if any(filename.lower().endswith(ext) for ext in image_extensions):
+                    image_files.append(os.path.join(dirname, filename))
+        
+        print(f"Found {len(image_files)} image files")
+        return image_files
+    
+    def sample_images(self, image_files, n=5):
+        """Display sample images"""
+        if not image_files:
+            print("No image files to sample")
+            return
+        
+        n = min(n, len(image_files))
+        plt.figure(figsize=(15, 5*n))
+        
+        for i in range(n):
+            img_path = image_files[i]
+            try:
+                # Try to open with rasterio for thermal imagery
+                with rasterio.open(img_path) as src:
+                    img = src.read(1)  # Read the first band
+                    plt.subplot(n, 1, i+1)
+                    show(img, ax=plt.gca(), title=f"Sample Image {i+1}: {os.path.basename(img_path)}")
+            except:
+                # Fall back to regular image opening
+                try:
+                    img = plt.imread(img_path)
+                    plt.subplot(n, 1, i+1)
+                    plt.imshow(img)
+                    plt.title(f"Sample Image {i+1}: {os.path.basename(img_path)}")
+                except:
+                    print(f"Could not open {img_path}")
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def create_dataset_from_directory(self, image_files, target_size=(224, 224)):
+        """Create dataset from image directory if no structured data available"""
+        # This is a fallback if no structured dataset is found
+        
+        print("Creating dataset from image directory...")
+        
+        # Dummy labels for demonstration - in a real scenario, these would come from file naming convention or metadata
+        # Example: Assuming images have naming convention like "hotspot_x.jpg" or "normal_x.jpg"
+        X = []
+        y = []
+        
+        for img_path in image_files:
+            try:
+                # Try to determine class from filename (this is a simplified approach)
+                file_basename = os.path.basename(img_path).lower()
+                
+                # Dummy labeling logic - customize according to your actual data
+                if 'hotspot' in file_basename or 'fire' in file_basename:
+                    label = 1  # Fire hotspot
+                else:
+                    label = 0  # Normal
+                
+                # Read and resize image
+                try:
+                    # Try with rasterio first (better for thermal/radiometric images)
+                    with rasterio.open(img_path) as src:
+                        img = src.read(1)  # Read first band
+                        img = cv2.resize(img, target_size)
+                        
+                        # Normalize
+                        if img.max() > 0:
+                            img = img / img.max()
+                except:
+                    # Fallback to regular image reading
+                    img = cv2.imread(img_path)
+                    if img is not None:
+                        img = cv2.resize(img, target_size)
+                        img = img / 255.0
+                    else:
+                        continue
+                
+                X.append(img)
+                y.append(label)
+            except Exception as e:
+                print(f"Error processing {img_path}: {e}")
+        
+        if X:
+            X = np.array(X)
+            y = np.array(y)
+            
+            # Reshape for CNN if images are grayscale
+            if len(X.shape) == 3:
+                X = X.reshape(X.shape[0], X.shape[1], X.shape[2], 1)
+            
+            print(f"Created dataset with {len(X)} images and {len(y)} labels")
+            print(f"X shape: {X.shape}, y shape: {y.shape}")
+            
+            return X, y
+        else:
+            print("Failed to create dataset. No valid images found.")
+            return None, None
+
+#=====================================================================
+# PART 2: HOTSPOT DETECTION CNN MODEL
+#=====================================================================
+
+class HotspotDetectionCNN:
+    """CNN model for detecting fire hotspots in thermal imagery"""
+    
+    def __init__(self, input_shape=(224, 224, 3)):
+        """Initialize with input shape"""
+        self.input_shape = input_shape
+        self.model = None
+    
+    def build_model(self):
+        """Build CNN architecture for hotspot detection"""
+        model = Sequential([
+            # First convolutional block
+            Conv2D(32, (3, 3), activation='relu', padding='same', input_shape=self.input_shape),
+            BatchNormalization(),
+            Conv2D(32, (3, 3), activation='relu', padding='same'),
+            BatchNormalization(),
+            MaxPooling2D(pool_size=(2, 2)),
+            Dropout(0.25),
+            
+            # Second convolutional block
+            Conv2D(64, (3, 3), activation='relu', padding='same'),
+            BatchNormalization(),
+            Conv2D(64, (3, 3), activation='relu', padding='same'),
+            BatchNormalization(),
+            MaxPooling2D(pool_size=(2, 2)),
+            Dropout(0.25),
+            
+            # Third convolutional block
+            Conv2D(128, (3, 3), activation='relu', padding='same'),
+            BatchNormalization(),
+            Conv2D(128, (3, 3), activation='relu', padding='same'),
+            BatchNormalization(),
+            MaxPooling2D(pool_size=(2, 2)),
+            Dropout(0.25),
+            
+            # Flatten and dense layers
+            Flatten(),
+            Dense(512, activation='relu'),
+            BatchNormalization(),
+            Dropout(0.5),
+            Dense(1, activation='sigmoid')  # Binary classification: hotspot or not
+        ])
+        
+        # Compile model
+        model.compile(
+            optimizer=Adam(learning_rate=0.001),
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        self.model = model
+        print(model.summary())
+        return model
+    
+    def train_model(self, X_train, y_train, X_val, y_val, batch_size=32, epochs=30):
+        """Train the hotspot detection model"""
+        if self.model is None:
+            self.build_model()
+        
+        # Data augmentation for training
+        datagen = ImageDataGenerator(
+            rotation_range=20,
+            width_shift_range=0.2,
+            height_shift_range=0.2,
+            shear_range=0.2,
+            zoom_range=0.2,
+            horizontal_flip=True,
+            fill_mode='nearest'
+        )
+        
+        # Callbacks for training
+        callbacks = [
+            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=0.00001),
+            ModelCheckpoint('hotspot_detection_model.h5', save_best_only=True, monitor='val_accuracy')
+        ]
+        
+        # Train the model
+        history = self.model.fit(
+            datagen.flow(X_train, y_train, batch_size=batch_size),
+            epochs=epochs,
+            validation_data=(X_val, y_val),
+            callbacks=callbacks
+        )
+        
+        return history
+    
+    def evaluate_model(self, X_test, y_test):
+        """Evaluate the trained model"""
+        if self.model is None:
+            raise ValueError("Model not trained yet")
+        
+        # Predict and evaluate
+        y_pred_prob = self.model.predict(X_test)
+        y_pred = (y_pred_prob > 0.5).astype(int).reshape(-1)
+        
+        # Print metrics
+        print("\nModel Evaluation:")
+        print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred))
+        
+        # Plot confusion matrix
+        cm = confusion_matrix(y_test, y_pred)
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Normal', 'Hotspot'], yticklabels=['Normal', 'Hotspot'])
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.title('Confusion Matrix')
+        plt.show()
+        
+        return y_pred, y_pred_prob
+    
+    def plot_training_history(self, history):
+        """Plot training history"""
+        plt.figure(figsize=(12, 5))
+        
+        # Plot accuracy
+        plt.subplot(1, 2, 1)
+        plt.plot(history.history['accuracy'], label='Train Accuracy')
+        plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+        plt.title('Model Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        
+        # Plot loss
+        plt.subplot(1, 2, 2)
+        plt.plot(history.history['loss'], label='Train Loss')
+        plt.plot(history.history['val_loss'], label='Validation Loss')
+        plt.title('Model Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.show()
+
+#=====================================================================
+# PART 3: FIRE INTENSITY MAPPING
+#=====================================================================
+
+class FireIntensityMapper:
+    """Class for mapping fire intensity from thermal imagery"""
+    
+    def __init__(self, model=None):
+        """Initialize with optional trained model"""
+        self.model = model
+    
+    def extract_temperature_data(self, thermal_image):
+        """
+        Extract temperature data from radiometric thermal image.
+        This is a simplified approach - actual implementation depends on the specific format and calibration of thermal data.
+        """
+        # For demonstration - in reality, this would depend on the format of your thermal data
+        # and might require specific calibration information
+        
+        # Assuming the image pixel values correspond to temperature values
+        # This is a simplification - real radiometric data would need proper calibration
+        temperature_map = thermal_image.copy()
+        
+        # Apply color mapping for visualization
+        colored_map = cv2.applyColorMap(np.uint8(255 * temperature_map), cv2.COLORMAP_JET)
+        
+        return temperature_map, colored_map
+    
+    def classify_intensity(self, temperature_map, thresholds=(0.3, 0.6, 0.85)):
+        """
+        Classify fire intensity based on temperature values.
+        
+        Args:
+            temperature_map: Normalized temperature map
+            thresholds: Tuple of thresholds for intensity classification
+                        (low-medium, medium-high, high-extreme)
+        
+        Returns:
+            intensity_map: Classified intensity map
+        """
+        # Create intensity map
+        intensity_map = np.zeros_like(temperature_map)
+        
+        # Apply thresholds
+        intensity_map[temperature_map >= thresholds[0]] = 1  # Low intensity
+        intensity_map[temperature_map >= thresholds[1]] = 2  # Medium intensity
+        intensity_map[temperature_map >= thresholds[2]] = 3  # High intensity
+        
+        return intensity_map
+    
+    def visualize_intensity(self, intensity_map):
+        """Visualize fire intensity"""
+        # Color coding for intensity levels
+        colors = [
+            [0, 0, 0],        # No fire (black)
+            [0, 0, 255],      # Low intensity (blue)
+            [0, 255, 255],    # Medium intensity (yellow)
+            [255, 0, 0]       # High intensity (red)
+        ]
+        
+        # Create RGB image
+        visualization = np.zeros((intensity_map.shape[0], intensity_map.shape[1], 3), dtype=np.uint8)
+        
+        for i in range(4):  # 4 intensity levels (0-3)
+            mask = intensity_map == i
+            visualization[mask] = colors[i]
+        
+        return visualization
+    
+    def detect_hotspots_from_intensity(self, intensity_map, min_intensity=2):
+        """
+        Detect hotspots from intensity map
+        
+        Args:
+            intensity_map: Classified intensity map
+            min_intensity: Minimum intensity level to be considered a hotspot
+        
+        Returns:
+            hotspots: List of (x, y) coordinates of detected hotspots
+        """
+        hotspots = []
+        
+        # Find regions with intensity at or above the minimum threshold
+        hot_regions = intensity_map >= min_intensity
+        
+        # Use connected components to find distinct hotspot regions
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(hot_regions.astype(np.uint8), connectivity=8)
+        
+        # Skip background (label 0)
+        for i in range(1, num_labels):
+            # Get area of the component
+            area = stats[i, cv2.CC_STAT_AREA]
+            
+            # Filter by size if needed
+            if area > 10:  # Arbitrary threshold to filter very small detections
+                x = int(centroids[i][0])
+                y = int(centroids[i][1])
+                hotspots.append((x, y))
+        
+        return hotspots
+    
+    def overlay_hotspots(self, image, hotspots, radius=5, color=(0, 255, 0)):
+        """Overlay hotspots on the image"""
+        overlay = image.copy()
+        
+        # Draw circles at hotspot locations
+        for x, y in hotspots:
+            cv2.circle(overlay, (x, y), radius, color, -1)
+            
+        return overlay
+
+#=====================================================================
+# PART 4: GEOSPATIAL MAPPING AND VISUALIZATION
+#=====================================================================
+
+class GeospatialMapper:
+    """Class for handling geospatial mapping of wildfire data"""
+    
+    def __init__(self):
+        """Initialize geospatial mapper"""
+        pass
+    
+    def create_fire_perimeter(self, hotspots, buffer_distance=0.001):
+        """
+        Create fire perimeter from hotspot points
+        
+        Args:
+            hotspots: List of (lon, lat) coordinates of hotspots
+            buffer_distance: Buffer distance in degrees (for simplicity)
+            
+        Returns:
+            perimeter: GeoDataFrame containing fire perimeter polygon
+        """
+        if not hotspots:
+            return None
+        
+        # Create points from hotspots
+        points = gpd.GeoSeries([Point(lon, lat) for lon, lat in hotspots])
+        points_gdf = gpd.GeoDataFrame(geometry=points)
+        
+        # Create buffer around points
+        buffered = points_gdf.buffer(buffer_distance)
+        
+        # Dissolve buffers to create single perimeter
+        union = buffered.unary_union
+        
+        # Create GeoDataFrame for the perimeter
+        perimeter_gdf = gpd.GeoDataFrame(geometry=[union])
+        
+        return perimeter_gdf
+    
+    def create_interactive_map(self, hotspots, perimeter=None, center=None):
+        """
+        Create interactive map with hotspots and fire perimeter
+        
+        Args:
+            hotspots: List of (lon, lat) coordinates of hotspots
+            perimeter: GeoDataFrame with fire perimeter polygon
+            center: (lat, lon) coordinates for map center, default to mean of hotspots
+            
+        Returns:
+            map_obj: Folium map object
+        """
+        if not hotspots:
+            print("No hotspots to display")
+            return None
+        
+        # Calculate center if not provided
+        if center is None:
+            center = [sum(lat for _, lat in hotspots) / len(hotspots),
+                     sum(lon for lon, _ in hotspots) / len(hotspots)]
+        
+        # Create map
+        m = folium.Map(location=center, zoom_start=13)
+        
+        # Add hotspots as markers
+        for lon, lat in hotspots:
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=5,
+                color='red',
+                fill=True,
+                fill_color='red',
+                fill_opacity=0.7,
+                popup=f"Hotspot: {lat:.6f}, {lon:.6f}"
+            ).add_to(m)
+        
+        # Add heatmap layer
+        heat_data = [[lat, lon] for lon, lat in hotspots]
+        HeatMap(heat_data).add_to(m)
+        
+        # Add perimeter if available
+        if perimeter is not None:
+            folium.GeoJson(
+                perimeter,
+                name='Fire Perimeter',
+                style_function=lambda x: {'color': 'orange', 'weight': 2, 'fillOpacity': 0.1}
+            ).add_to(m)
+        
+        # Add layer control
+        folium.LayerControl().add_to(m)
+        
+        return m
+    
+    def calculate_affected_area(self, perimeter, land_use_data=None):
+        """
+        Calculate affected area by land use type
+        
+        Args:
+            perimeter: GeoDataFrame with fire perimeter polygon
+            land_use_data: GeoDataFrame with land use polygons
+            
+        Returns:
+            affected_areas: DataFrame with affected area by land use type
+        """
+        if perimeter is None:
+            return None
+        
+        # Calculate total area in square kilometers
+        area_sqkm = perimeter.area[0] * 111.32 * 111.32  # Rough conversion from degrees to km
+        
+        # Create basic results
+        results = {'Total Area (sq km)': area_sqkm}
+        
+        # If land use data is available, calculate area by type
+        if land_use_data is not None:
+            # Intersect perimeter with land use
+            intersection = gpd.overlay(land_use_data, perimeter, how='intersection')
+            
+            # Calculate area by land use type
+            area_by_type = intersection.groupby('land_use')['geometry'].apply(lambda x: sum(item.area for item in x) * 111.32 * 111.32)
+            
+            # Add to results
+            for land_type, area in area_by_type.items():
+                results[f"{land_type} (sq km)"] = area
+        
+        return pd.DataFrame([results])
+
+#=====================================================================
+# PART 5: PREDICTIVE ANALYTICS AND FIRE BEHAVIOR MODELING
+#=====================================================================
+
+class FirePredictionModel:
+    """Class for predicting fire behavior based on thermal data and environmental factors"""
+    
+    def __init__(self):
+        """Initialize fire prediction model"""
+        self.model = None
+    
+    def prepare_features(self, thermal_data, wind_data=None, topography_data=None, vegetation_data=None):
+        """
+        Prepare features for fire prediction model
+        
+        Args:
+            thermal_data: DataFrame with thermal imagery features
+            wind_data: DataFrame with wind speed and direction
+            topography_data: DataFrame with elevation, slope, aspect
+            vegetation_data: DataFrame with vegetation types and densities
+            
+        Returns:
+            X: Feature matrix
+        """
+        features = []
+        
+        # Process thermal data
+        if thermal_data is not None:
+            features.append(thermal_data)
+        
+        # Process wind data if available
+        if wind_data is not None:
+            features.append(wind_data)
+        
+        # Process topography data if available
+        if topography_data is not None:
+            features.append(topography_data)
+        
+        # Process vegetation data if available
+        if vegetation_data is not None:
+            features.append(vegetation_data)
+        
+        # Combine all features
+        if features:
+            X = pd.concat(features, axis=1)
+            return X
+        else:
+            return None
+    
+    def train_prediction_model(self, X, y, test_size=0.2):
+        """
+        Train fire spread prediction model
+        
+        Args:
+            X: Feature matrix
+            y: Target variable (fire spread rate or direction)
+            test_size: Proportion of data for testing
+            
+        Returns:
+            trained_model: Trained prediction model
+            X_test: Test features
+            y_test: Test targets
+        """
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+        
+        # Create and train model
+        model = GradientBoostingRegressor(n_estimators=100, random_state=42)
+        model.fit(X_train, y_train)
+        
+        # Evaluate model
+        train_score = model.score(X_train, y_train)
+        test_score = model.score(X_test, y_test)
+        
+        print(f"Model R² score - Train: {train_score:.4f}, Test: {test_score:.4f}")
+        
+        self.model = model
+        return model, X_test, y_test
+    
+    def predict_fire_spread(self, X):
+        """
+        Predict fire spread using trained model
+        
+        Args:
+            X: Feature matrix
+            
+        Returns:
+            predictions: Predicted fire spread values
+        """
+        if self.model is None:
+            raise ValueError("Model not trained yet")
+        
+        predictions = self.model.predict(X)
+        return predictions
+    
+    def feature_importance(self):
+        """Analyze feature importance"""
+        if self.model is None:
+            raise ValueError("Model not trained yet")
+        
+        # Get feature importance
+        importances = self.model.feature_importances_
+        
+        return importances
+
+#=====================================================================
+# PART 6: MAIN WORKFLOW AND INTEGRATION
+#=====================================================================
+
+class WildfireMonitoringSystem:
+    """Main class integrating all components of the wildfire monitoring system"""
+    
+    def __init__(self, base_path='/kaggle/input'):
+        """Initialize wildfire monitoring system"""
+        self.base_path = base_path
+        self.data_explorer = DataExplorer(base_path)
+        self.hotspot_detector = HotspotDetectionCNN()
+        self.intensity_mapper = FireIntensityMapper()
+        self.geospatial_mapper = GeospatialMapper()
+        self.prediction_model = FirePredictionModel()
+        
+        # Store data and models
+        self.metadata = None
+        self.image_files = None
+        self.X = None
+        self.y = None
+        self.model = None
+        
+    def run_data_preparation(self):
+        """Run data preparation pipeline"""
+        print("===== Starting Data Preparation =====")
+        
+        # Load metadata if available
+        self.metadata = self.data_explorer.load_metadata()
+        
+        # Scan for image files
+        self.image_files = self.data_explorer.scan_image_files()
+        
+        # Display sample images
+        if self.image_files:
+            self.data_explorer.sample_images(self.image_files)
+        
+        # Create dataset
+        self.X, self.y = self.data_explorer.create_dataset_from_directory(self.image_files)
+        
+        if self.X is not None and self.y is not None:
+            print("Data preparation complete.")
+        else:
+            print("Data preparation failed.")
+        
+        return self.X, self.y
+    
+    def train_hotspot_detection_model(self):
+        """Train hotspot detection model"""
+        print("\n===== Training Hotspot Detection Model =====")
+        
+        if self.X is None or self.y is None:
+            print("No data available. Run data preparation first.")
+            return None
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(self.X, self.y, test_size=0.2, random_state=42)
+        X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
+        
+        # Build and train model
+        input_shape = self.X.shape[1:]
+        self.hotspot_detector = HotspotDetectionCNN(input_shape=input_shape)
+        self.hotspot_detector.build_model()
+        
+        history = self.hotspot_detector.train_model(X_train, y_train, X_val, y_val)
+        
+        # Evaluate model
+        y_pred, y_pred_prob = self.hotspot_detector.evaluate_model(X_test, y_test)
+        
+        # Plot training history
+        self.hotspot_detector.plot_training_history(history)
+        
+        self.model = self.hotspot_detector.model
+        return self.model
+    
+    def analyze_thermal_image(self, image_path):
+        """Analyze a single thermal image"""
+        print(f"\n===== Analyzing Thermal Image: {os.path.basename(image_path)} =====")
+        
+        try:
+            # Load image
+            try:
+                with rasterio.open(image_path) as src:
+                    thermal_image = src.read(1)
+            except:
+                thermal_image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+                
+            if thermal_image is None:
+                print(f"Failed to load image: {image_path}")
+                return None
+            
+            # Resize for processing
+            thermal_image_resized = cv2.resize(thermal_image, (224, 224))
+            
+            # Extract temperature data
+            temp_map, colored_map = self.intensity_mapper.extract_temperature_data(thermal_image_resized)
+            
+            # Classify intensity
+            intensity_map = self.intensity_mapper.classify_intensity(temp_map / np.max(temp_map) if np.max(temp_map) > 0 else temp_map)
+            
+            # Visualize intensity
+            intensity_viz = self.intensity_mapper.visualize_intensity(intensity_map)
+            
+            # Detect hotspots
+            hotspots = self.intensity_mapper.detect_hotspots_from_intensity(intensity_map)
+            
+            # Overlay hotspots
+            result_image = self.intensity_mapper.overlay_hotspots(colored_map, hotspots)
+            
+            # Display results
+            plt.figure(figsize=(15, 10))
+            
+            plt.subplot(2, 2, 1)
+            plt.imshow(thermal_image_resized, cmap='gray')
+            plt.title('Original Thermal Image')
+            plt.axis('off')
+            
+            plt.subplot(2, 2, 2)
+            plt.imshow(colored_map)
+            plt.title('Temperature Map')
+            plt.axis('off')
+            
+            plt.subplot(2, 2, 3)
+            plt.imshow(intensity_viz)
+            plt.title('Fire Intensity')
+            plt.axis('off')
+            
+            plt.subplot(2, 2, 4)
+            plt.imshow(result_image)
+            plt.title(f'Detected Hotspots ({len(hotspots)})')
+            plt.axis('off')
+            
+            plt.tight_layout()
+            plt.show()
+            
+            return {
+                'thermal_image': thermal_image_resized,
+                'temperature_map': temp_map,
+                'intensity_map': intensity_map,
+                'hotspots': hotspots,
+                'result_image': result_image
+            }
+        except Exception as e:
+            print(f"Error analyzing image: {e}")
+            return None
+    
+    def demonstrate_geospatial_mapping(self, hotspots_with_coords=None):
+        """Demonstrate geospatial mapping capabilities"""
+        print("\n===== Demonstrating Geospatial Mapping =====")
+        
+        # If no real hotspots with coordinates are available, generate sample data
+        if hotspots_with_coords is None:
+            # Sample data - in a real scenario, these would be actual GPS coordinates
+            # Format: [(longitude, latitude), ...]
+            hotspots_with_coords = [
+                (-122.4194, 37.7749),  # Sample coordinates - would be actual fire locations in reality
+                (-122.4130, 37.7755),
+                (-122.4102, 37.7771),
+                (-122.4160, 37.7790),
+                (-122.4175, 37.7765)
+            ]
+        
+        # Create fire perimeter
+        perimeter = self.geospatial_mapper.create_fire_perimeter(hotspots_with_coords)
+        
+        # Create interactive map
+        map_obj = self.geospatial_mapper.create_interactive_map(hotspots_with_coords, perimeter)
+        
+        # Calculate affected area
+        affected_area = self.geospatial_mapper.calculate_affected_area(perimeter)
+        
+        print(f"Affected Area Summary:\n{affected_area}")
+        
+        # Display map (in notebook)
+        try:
+            display(map_obj)
+        except:
+            print("Map display requires a Jupyter notebook environment")
+        
+        return map_obj, perimeter, affected_area
+    
+    def demonstrate_fire_prediction(self, sample_size=1000):
+        """Demonstrate fire prediction capabilities using simulated data"""
+        print("\n===== Demonstrating Fire Prediction Model =====")
+        
+        # Generate synthetic data for demonstration
+        np.random.seed(42)
+        
+        # Features: temperature, wind speed, wind direction, slope, vegetation density
+        X = pd.DataFrame({
+            'max_temperature': np.random.uniform(300, 1200, sample_size),
+            'wind_speed': np.random.uniform(0, 30, sample_size),
+            'wind_direction': np.random.uniform(0, 360, sample_size),
+            'slope': np.random.uniform(0, 45, sample_size),
+            'vegetation_density': np.random.uniform(0, 1, sample_size)
+        })
+        
+        # Target: fire spread rate (m/min)
+        # Simple model: spread ~ temp + wind_speed + slope + vegetation
+        y = (
+            0.01 * X['max_temperature'] + 
+            0.5 * X['wind_speed'] * np.cos(np.radians(X['wind_direction'])) + 
+            0.2 * X['slope'] + 
+            10 * X['vegetation_density'] + 
+            np.random.normal(0, 2, sample_size)  # Add some noise
+        )
+        
+        # Train model
+        model, X_test, y_test = self.prediction_model.train_prediction_model(X, y)
+        
+        # Make predictions
+        y_pred = self.prediction_model.predict_fire_spread(X_test)
+        
+        # Calculate error metrics
+        mse = mean_squared_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+        
+        print(f"Mean Squared Error: {mse:.4f}")
+        print(f"R² Score: {r2:.4f}")
+        
+        # Plot actual vs predicted
+        plt.figure(figsize=(10, 6))
+        plt.scatter(y_test, y_pred, alpha=0.5)
+        plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
+        plt.xlabel('Actual Fire Spread Rate (m/min)')
+        plt.ylabel('Predicted Fire Spread Rate (m/min)')
+        plt.title('Actual vs Predicted Fire Spread Rate')
+        plt.grid(True)
+        plt.show()
+        
+        # Plot feature importance
+        importances = self.prediction_model.feature_importance()
+        
+        plt.figure(figsize=(10, 6))
+        plt.bar(X.columns, importances)
+        plt.xlabel('Features')
+        plt.ylabel('Importance')
+        plt.title('Feature Importance for Fire Spread Prediction')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+        
+        return model, mse, r2
+    
+    def visualize_results(self, results_dict):
+        """Create comprehensive visualizations from analysis results"""
+        print("\n===== Creating Comprehensive Visualizations =====")
+        
+        # Example visualization of fire intensity over time (with simulated data)
+        # In reality, this would use actual time series data from multiple drone flights
+        
+        # Generate synthetic time series data
+        dates = pd.date_range(start='2023-01-01', periods=10, freq='H')
+        intensity_over_time = pd.DataFrame({
+            'timestamp': dates,
+            'avg_temperature': np.random.uniform(400, 900, 10),
+            'max_temperature': np.random.uniform(700, 1200, 10),
+            'hotspot_count': np.random.randint(5, 30, 10),
+            'affected_area_km2': np.cumsum(np.random.uniform(0.1, 0.5, 10))
+        })
+        
+        # Create interactive plots
+        fig = go.Figure()
+        
+        # Add temperature traces
+        fig.add_trace(go.Scatter(
+            x=intensity_over_time['timestamp'],
+            y=intensity_over_time['avg_temperature'],
+            mode='lines+markers',
+            name='Average Temperature',
+            line=dict(color='blue')
+        ))
+        
+        fig.add_trace(go.Scatter(
+            x=intensity_over_time['timestamp'],
+            y=intensity_over_time['max_temperature'],
+            mode='lines+markers',
+            name='Maximum Temperature',
+            line=dict(color='red')
+        ))
+        
+        # Add hotspot count on secondary y-axis
+        fig.add_trace(go.Scatter(
+            x=intensity_over_time['timestamp'],
+            y=intensity_over_time['hotspot_count'],
+            mode='lines+markers',
+            name='Hotspot Count',
+            line=dict(color='green'),
+            yaxis='y2'
+        ))
+        
+        # Update layout
+        fig.update_layout(
+            title='Fire Intensity and Hotspots Over Time',
+            xaxis=dict(title='Time'),
+            yaxis=dict(
+                title='Temperature (K)',
+                side='left'
+            ),
+            yaxis2=dict(
+                title='Hotspot Count',
+                side='right',
+                overlaying='y',
+                showgrid=False
+            ),
+            legend=dict(
+                x=0.01,
+                y=0.99,
+                bgcolor='rgba(255, 255, 255, 0.5)'
+            ),
+            hovermode='x unified'
+        )
+        
+        # Display plot (in notebook)
+        try:
+            fig.show()
+        except:
+            print("Interactive plot display requires a Jupyter notebook environment")
+        
+        # Create affected area visualization
+        fig2 = px.line(
+            intensity_over_time, 
+            x='timestamp', 
+            y='affected_area_km2',
+            markers=True,
+            title='Cumulative Affected Area Over Time'
+        )
+        
+        fig2.update_layout(
+            xaxis_title='Time',
+            yaxis_title='Affected Area (sq km)',
+            hovermode='x unified'
+        )
+        
+        # Display plot
+        try:
+            fig2.show()
+        except:
+            print("Interactive plot display requires a Jupyter notebook environment")
+        
+        return {
+            'intensity_over_time': intensity_over_time,
+            'intensity_plot': fig,
+            'area_plot': fig2
+        }
+
+#=====================================================================
+# PART 7: MAIN EXECUTION FLOW
+#=====================================================================
+
+def main():
+    """Main execution function"""
+    print("==============================")
+    print("WILDFIRE MONITORING SYSTEM USING RADIOMETRIC THERMAL UAV IMAGERY")
+    print("==============================")
+    
+    # Initialize the system
+    wildfire_system = WildfireMonitoringSystem()
+    
+    # Set up experiment tracking
+    current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+    experiment_name = f"wildfire_monitoring_{current_time}"
+    print(f"Experiment name: {experiment_name}")
+    
+    try:
+        # Step 1: Data preparation
+        X, y = wildfire_system.run_data_preparation()
+        
+        if X is None or y is None:
+            print("No valid dataset found. Generating synthetic data for demonstration.")
+            # Generate synthetic data
+            X = np.random.rand(100, 224, 224, 3)
+            y = np.random.randint(0, 2, 100)
+            wildfire_system.X = X
+            wildfire_system.y = y
+        
+        # Step 2: Train hotspot detection model
+        model = wildfire_system.train_hotspot_detection_model()
+        
+        # Step 3: Analyze sample thermal images
+        if wildfire_system.image_files:
+            # Analyze a few sample images
+            sample_images = wildfire_system.image_files[:3]
+            analysis_results = [wildfire_system.analyze_thermal_image(img) for img in sample_images]
+        else:
+            print("No actual images to analyze.")
+            analysis_results = []
+        
+        # Step 4: Demonstrate geospatial mapping
+        map_obj, perimeter, affected_area = wildfire_system.demonstrate_geospatial_mapping()
+        
+        # Step 5: Demonstrate fire prediction model
+        prediction_model, mse, r2 = wildfire_system.demonstrate_fire_prediction()
+        
+        # Step 6: Create visualizations
+        viz_results = wildfire_system.visualize_results({})
+        
+        print("\n==============================")
+        print("SYSTEM DEMONSTRATION COMPLETE")
+        print("==============================")
+        print("Key results:")
+        print(f"- Hotspot detection model accuracy: {model.history.history['val_accuracy'][-1]:.4f}")
+        print(f"- Fire spread prediction model R²: {r2:.4f}")
+        print(f"- Fire affected area (demonstration): {affected_area.iloc[0]['Total Area (sq km)']:.2f} sq km")
+        
+        # Save models (if running in Kaggle)
+        model.save('hotspot_detection_model.h5')
+        print("\nModels saved to current directory.")
+        
+    except Exception as e:
+        print(f"Error in main execution: {e}")
+        import traceback
+        traceback.print_exc()
+
+# Execute if run as script
+if __name__ == "__main__":
+    main()
